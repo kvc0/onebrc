@@ -1,4 +1,5 @@
 use std::{
+    fs::File,
     io::{BufRead, Read, Seek},
     ops::AddAssign,
     os::unix::fs::MetadataExt,
@@ -6,6 +7,7 @@ use std::{
 };
 
 use ahash::{HashMap, HashMapExt};
+use memmap::Mmap;
 
 fn main() {
     let start = std::time::Instant::now();
@@ -13,7 +15,6 @@ fn main() {
         file_name: "measurements.txt".to_string(),
         workers: num_cpus::get(),
         // workers: 1,
-        buffer_size: 128 * 2 << 20,
         unique_names_hint: 10000,
     });
     eprintln!("ran in {:#?}", start.elapsed());
@@ -23,7 +24,6 @@ fn main() {
 struct Options {
     file_name: String,
     workers: usize,
-    buffer_size: usize,
     unique_names_hint: usize,
 }
 
@@ -147,39 +147,28 @@ fn run_worker(
     worker_index: usize,
     metadata: std::fs::Metadata,
 ) -> HashMap<Vec<u8>, Aggregate> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(&options.file_name)
-        .expect("can open {file}");
+    let fin = File::open(&options.file_name).expect("can open file");
+    let file = unsafe { memmap::Mmap::map(&fin) }.expect("can map file");
+
     let mut worker_file_offset = worker_offset_step * worker_index;
     let worker_file_end = if worker_index + 1 == options.workers {
         metadata.size() as usize // make sure there isn't any funny business with the last line with lots of cores
     } else {
         worker_offset_step * (worker_index + 1)
     };
-    file.seek(std::io::SeekFrom::Start(worker_file_offset as u64))
-        .expect("initial seek");
-    seek_to_line_start(&mut worker_file_offset, &mut file);
+    seek_to_line_start(&mut worker_file_offset, &file);
     eprintln!("worker {worker_index:02} offset {worker_file_offset}");
-
-    let mut reader = std::io::BufReader::with_capacity(options.buffer_size, file);
-    assert_eq!(
-        worker_file_offset as u64,
-        reader.stream_position().expect("it knows"),
-        "stream is at the right place"
-    );
-    let mut line_buffer = Vec::with_capacity(256);
 
     let mut stations: ahash::HashMap<Vec<u8>, Aggregate> =
         ahash::HashMap::with_capacity(options.unique_names_hint);
 
     while worker_file_offset < worker_file_end {
-        let len = reader
-            .read_until(b';', &mut line_buffer)
-            .expect("can read a station name");
-        worker_file_offset += len;
+        let mut name_len = 1;
+        while file[worker_file_offset + name_len] != b';' {
+            name_len += 1;
+        }
 
-        let station_name = &line_buffer[0..(len-1)];
+        let station_name = &file[worker_file_offset..(worker_file_offset + name_len)];
         let station = match stations.get_mut(station_name) {
             Some(station) => station,
             None => {
@@ -189,19 +178,18 @@ fn run_worker(
                     .expect("I just inserted this")
             }
         };
-        // SAFETY: I don't need to zero the bytes
-        unsafe {
-            line_buffer.set_len(0);
+        worker_file_offset += name_len + 1;
+
+        let mut number_len = 1;
+        while worker_file_offset + number_len < file.len()
+            && file[worker_file_offset + number_len] != b'\n'
+        {
+            number_len += 1;
         }
 
-        let len = reader
-            .read_until(b'\n', &mut line_buffer)
-            .expect("can read a value");
-        worker_file_offset += len;
-
-        let mut value = &line_buffer[0..(len-1)];
+        let mut value = &file[worker_file_offset..(worker_file_offset + number_len)];
         let negative = if value[0] == b'-' {
-            value = &line_buffer[1..len];
+            value = &value[1..number_len];
             true
         } else {
             false
@@ -226,10 +214,7 @@ fn run_worker(
         if negative {
             parsed = -parsed;
         }
-        // SAFETY: I don't need to zero the bytes
-        unsafe {
-            line_buffer.set_len(0);
-        }
+        worker_file_offset += number_len + 1;
 
         *station += parsed;
     }
@@ -237,30 +222,16 @@ fn run_worker(
     stations
 }
 
-fn seek_to_line_start(worker_file_offset: &mut usize, file: &mut std::fs::File) {
+fn seek_to_line_start(worker_file_offset: &mut usize, file: &Mmap) {
     // if reading from start, it's at a line start. No seek necessary
     if 0 < *worker_file_offset {
-        file.seek(std::io::SeekFrom::Current(-1))
-            .expect("seek prior byte");
-        let mut previous_byte: [u8; 1] = [0];
-        let read = file.read(&mut previous_byte).expect("read previous byte");
-        assert_eq!(1, read, "must be able to read previous byte");
-        // if we luck out, we're already at a line start. No seek necessary
-        if previous_byte[0] != b'\n' {
-            let mut seek_buffer: [u8; 1024] = [0; 1024];
-            let read_bytes = file.read(&mut seek_buffer).expect("read end of line");
-            assert!(512 < read_bytes, "must be able to read end of line");
-            let mut i = 0;
-            while i < read_bytes {
-                if seek_buffer[i] == b'\n' {
-                    break;
-                }
-                i += 1;
-            }
-            assert_ne!(i, read_bytes, "must be able to find end of line");
-            *worker_file_offset += i + 1; // +1 to skip past \n
-            file.seek(std::io::SeekFrom::Start(*worker_file_offset as u64))
-                .expect("seek to next line");
+        let mut previous_byte = file[*worker_file_offset - 1];
+        *worker_file_offset -= 1;
+        while *worker_file_offset < file.len() && file[*worker_file_offset] != b'\n' {
+            *worker_file_offset += 1;
+        }
+        if *worker_file_offset < file.len() {
+            *worker_file_offset += 1;
         }
     }
 }
